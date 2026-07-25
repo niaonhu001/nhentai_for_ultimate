@@ -1,0 +1,93 @@
+{
+  "protocol_version": "1.0",
+  "plugin": {
+    "id": "comic.nhentai",
+    "name": "NHentai",
+    "version": "0.1.0",
+    "entrypoint": "./ultimate_provider.py:NHentaiProvider",
+    "config_key": "nhentai"
+  },
+  "media_types": ["comic"],
+  "identity": {
+    "content_type": "comic",
+    "host_id_prefix": "NH",
+    "platform_label": "NHentai",
+    "aliases": ["nhentai", "nh"]
+  },
+  "presentation": {
+    "media_card": {
+      "cover": {
+        "aspect_ratio": "2 / 3",
+        "fit": "cover",
+        "path_mode": "remote_first"
+      },
+      "badge": {
+        "show_platform_label": true,
+        "label": "NHentai"
+      }
+    }
+  },
+  "capabilities": [
+    { "key": "catalog.search" },
+    { "key": "catalog.detail" },
+    { "key": "asset.bundle.fetch" },
+    { "key": "asset.cover.fetch" },
+    { "key": "asset.preview.resolve" },
+    { "key": "storage.comic_dir.resolve" },
+    { "key": "health.query.status" }
+  ],
+  "configuration": {
+    "order": 70,
+    "label": "NHentai",
+    "sections": [
+      {
+        "id": "basic",
+        "label": "基础配置",
+        "fields": [
+          { "key": "enabled", "label": "启用", "type": "boolean" },
+          { "key": "base_url", "label": "API 站点地址", "type": "text", "placeholder": "https://nhentai.net" },
+          { "key": "api_key", "label": "API Key", "type": "password", "placeholder": "可选，留空走匿名访问", "secret": true },
+          { "key": "user_agent", "label": "User-Agent", "type": "text", "placeholder": "ULTIMATE_WEB/0.1 (https://github.com)" }
+        ]
+      },
+      {
+        "id": "cdn",
+        "label": "CDN 与网络",
+        "fields": [
+          { "key": "image_cdn_base", "label": "图片 CDN", "type": "text", "placeholder": "https://i.nhentai.net" },
+          { "key": "thumb_cdn_base", "label": "缩略图 CDN", "type": "text", "placeholder": "https://t.nhentai.net" },
+          { "key": "timeout_seconds", "label": "请求超时秒数", "type": "number", "placeholder": "30" },
+          { "key": "proxy", "label": "HTTP 代理", "type": "text", "placeholder": "如需科学上网可填，例如 http://127.0.0.1:7890" }
+        ]
+      }
+    ]
+  },
+  "resource_policy": {
+    "assets": {
+      "preview_image": {
+        "available": true,
+        "download_enabled": true,
+        "request_profiles": [
+          {
+            "match_hosts": ["nhentai.net", "i.nhentai.net", "t.nhentai.net"],
+            "referer": "https://nhentai.net/",
+            "cookie_config_key": "nhentai"
+          }
+        ]
+      },
+      "cover_image": {
+        "available": true,
+        "download_enabled": true,
+        "request_profiles": [
+          {
+            "match_hosts": ["nhentai.net", "i.nhentai.net", "t.nhentai.net"],
+            "referer": "https://nhentai.net/"
+          }
+        ]
+      }
+    }
+  },
+  "storage": {
+  "comic_dir": { "template": "{original_id}" }
+}
+}
