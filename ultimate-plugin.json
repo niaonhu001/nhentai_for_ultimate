@@ -1,9 +1,9 @@
 {
-  "protocol_version": "1.0",
+  "protocol_version": "2.0",
   "plugin": {
     "id": "comic.nhentai",
     "name": "NHentai",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "entrypoint": "./ultimate_provider.py:NHentaiProvider",
     "config_key": "nhentai"
   },
@@ -18,6 +18,7 @@
     "media_card": {
       "cover": {
         "aspect_ratio": "2 / 3",
+        "mobile_aspect_ratio": "2 / 3",
         "fit": "cover",
         "path_mode": "remote_first"
       },
@@ -34,11 +35,18 @@
     { "key": "asset.cover.fetch" },
     { "key": "asset.preview.resolve" },
     { "key": "storage.comic_dir.resolve" },
-    { "key": "health.query.status" }
+    { "key": "health.query.status" },
+    { "key": "taxonomy.tags" },
+    { "key": "taxonomy.tag_search" }
   ],
   "configuration": {
     "order": 70,
     "label": "NHentai",
+    "credential": {
+      "enabled_field": "enabled",
+      "required_fields": [],
+      "disabled_message": "NHentai 未启用，不能使用该平台查询。"
+    },
     "sections": [
       {
         "id": "basic",
@@ -64,30 +72,47 @@
   },
   "resource_policy": {
     "assets": {
-      "preview_image": {
+      "image": {
         "available": true,
         "download_enabled": true,
         "request_profiles": [
           {
             "match_hosts": ["nhentai.net", "i.nhentai.net", "t.nhentai.net"],
             "referer": "https://nhentai.net/",
-            "cookie_config_key": "nhentai"
+            "frontend_proxy": true
           }
         ]
       },
-      "cover_image": {
+      "cover": {
         "available": true,
         "download_enabled": true,
         "request_profiles": [
           {
             "match_hosts": ["nhentai.net", "i.nhentai.net", "t.nhentai.net"],
-            "referer": "https://nhentai.net/"
+            "referer": "https://nhentai.net/",
+            "frontend_proxy": true
           }
         ]
       }
     }
   },
   "storage": {
-  "comic_dir": { "template": "{original_id}" }
-}
+    "comic_dir": {
+      "template": "{original_id}"
+    }
+  },
+  "packaging": {
+    "android": {
+      "enabled": true,
+      "pip_options": ["--no-deps"],
+      "pip_install_args": [],
+      "pip_requirements": ["requests"]
+    },
+    "external": {
+      "pip_requirements": ["requests"]
+    },
+    "pyinstaller": {
+      "pip_requirements": ["requests"]
+    }
+  }
 }

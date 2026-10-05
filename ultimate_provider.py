@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -30,7 +31,24 @@ _TAG_TYPE_CHARACTER = "character"
 _TAG_TYPE_LANGUAGE = "language"
 _TAG_TYPE_CATEGORY = "category"
 
+# 所有已知标签类型（对应 API 的 tag_type 路径参数）
+_ALL_TAG_TYPES = ["tag", "artist", "parody", "character", "category", "language", "group"]
+
 _TOKEN_MASK_VALUES = {"", "********", "******", "__KEEP__"}
+
+SUPPORTED_CAPABILITIES = frozenset(
+    {
+        "catalog.search",
+        "catalog.detail",
+        "asset.bundle.fetch",
+        "asset.cover.fetch",
+        "asset.preview.resolve",
+        "storage.comic_dir.resolve",
+        "health.query.status",
+        "taxonomy.tags",
+        "taxonomy.tag_search",
+    }
+)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -96,9 +114,12 @@ class NHentaiProvider(ProtocolProvider):
     def normalize_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         raw = dict(payload or {})
         normalized: Dict[str, Any] = {}
-        normalized["enabled"] = _as_bool(raw.get("enabled"), True)
+        normalized["enabled"] = _as_bool(raw.get("enabled"), False)
         normalized["base_url"] = _normalize_base_url(raw.get("base_url"))
-        normalized["api_key"] = str(raw.get("api_key") or "").strip()
+        # 掩码/空值不写回，避免保存配置时把已存的 API Key 清空（宿主侧已无密文保护）
+        raw_api_key = str(raw.get("api_key") or "").strip()
+        if raw_api_key and raw_api_key not in _TOKEN_MASK_VALUES:
+            normalized["api_key"] = raw_api_key
         normalized["user_agent"] = str(raw.get("user_agent") or "").strip() or DEFAULT_USER_AGENT
 
         # CDN base：如果等于 base_url（用户误填了主站地址），回退到默认 CDN
@@ -128,7 +149,7 @@ class NHentaiProvider(ProtocolProvider):
 
     def get_query_status(self, config: Dict[str, Any]) -> Dict[str, Any]:
         normalized = self.normalize_config(config)
-        enabled = _as_bool(normalized.get("enabled"), True)
+        enabled = _as_bool(normalized.get("enabled"), False)
         base_url = str(normalized.get("base_url") or "").strip()
         configured = bool(enabled and base_url)
         return {
@@ -193,17 +214,24 @@ class NHentaiProvider(ProtocolProvider):
             if title:
                 return title
         # search 形态
-        title = str(gallery.get("english_title") or "").strip()
-        if title:
-            return title
-        title = str(gallery.get("pretty_title") or "").strip()
-        if title:
-            return title
-        title = str(gallery.get("japanese_title") or "").strip()
-        if title:
-            return title
-        gallery_id = str(gallery.get("id") or "").strip()
-        return f"nhentai-{gallery_id}" if gallery_id else "untitled"
+        return str(gallery.get("english_title") or "").strip()
+
+    @staticmethod
+    def _extract_tag_name(raw_name: Any) -> str:
+        """从 nhentai tag 对象中提取英文标签名。
+        
+        nhentai API 中 tag 的 name 字段可能是：
+          - 字符串（如 "blowjob"）
+          - 对象（如 {"english": "blowjob", "japanese": "フェラチオ"}）
+        """
+        if isinstance(raw_name, dict):
+            return str(
+                raw_name.get("english")
+                or raw_name.get("pretty")
+                or raw_name.get("name")
+                or ""
+            ).strip()
+        return str(raw_name or "").strip()
 
     def _extract_subtitle(self, gallery: Dict[str, Any]) -> str:
         title_obj = gallery.get("title")
@@ -290,7 +318,7 @@ class NHentaiProvider(ProtocolProvider):
         for item in raw_tags:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name") or "").strip()
+            name = self._extract_tag_name(item.get("name"))
             tag_type = str(item.get("type") or "").strip().lower()
             if not name:
                 continue
@@ -320,6 +348,7 @@ class NHentaiProvider(ProtocolProvider):
             "album_id": gallery_id,
             "title": title,
             "subtitle": subtitle,
+            "title_jp": subtitle,
             "author": ", ".join(tags["artists"]) or "Unknown",
             "cover_url": cover_url,
             "tags": tags["tags"],
@@ -400,13 +429,49 @@ class NHentaiProvider(ProtocolProvider):
 
     # ---------- 协议入口 ----------
 
+    def _declared_capabilities(self) -> set:
+        """以清单声明为准；清单缺少 capabilities 时回退到代码内置能力集。"""
+        raw = None
+        if isinstance(self.manifest, dict):
+            raw = self.manifest.get("capabilities")
+        declared = {
+            str((item or {}).get("key") or "").strip()
+            for item in (raw or [])
+            if isinstance(item, dict)
+        }
+        declared.discard("")
+        return declared or set(SUPPORTED_CAPABILITIES)
+
     def execute(self, capability: str, params: Dict[str, Any], context: Dict[str, Any], config: Dict[str, Any]):
         normalized = self.normalize_config(config)
-        if not _as_bool(normalized.get("enabled"), True):
-            raise RuntimeError("NHentai 插件未启用。")
+        if capability not in self._declared_capabilities():
+            raise ValueError(f"unsupported capability: {capability}")
 
         if capability == "health.query.status":
             return self.get_query_status(config)
+
+        enabled = _as_bool(normalized.get("enabled"), False)
+
+        # taxonomy.* 不参与启用门禁：未启用时按宿主契约优雅降级为空结果
+        if capability == "taxonomy.tags":
+            if not enabled:
+                return {"tags": [], "categories": {}}
+            return self._handle_tags(self._build_session(normalized), normalized, params)
+        if capability == "taxonomy.tag_search":
+            if not enabled:
+                return {
+                    "page": _as_int(params.get("page"), 1, 1, 10000),
+                    "has_next": False,
+                    "albums": [],
+                }
+            return self._handle_tag_search(self._build_session(normalized), normalized, params)
+
+        # storage.* 是纯路径解析，既不联网也不依赖启用状态
+        if capability == "storage.comic_dir.resolve":
+            return self._handle_comic_dir_resolve(params, normalized)
+
+        if not enabled:
+            raise RuntimeError("NHentai 插件未启用。")
 
         session = self._build_session(normalized)
 
@@ -420,12 +485,207 @@ class NHentaiProvider(ProtocolProvider):
             return self._handle_cover_fetch(session, normalized, params)
         if capability == "asset.preview.resolve":
             return self._handle_preview_resolve(session, normalized, params)
-        if capability == "storage.comic_dir.resolve":
-            return self._handle_comic_dir_resolve(params, normalized)
 
         raise ValueError(f"unsupported capability: {capability}")
 
     # ---------- 能力实现 ----------
+
+    def _handle_tags(
+        self,
+        session: requests.Session,
+        config: Dict[str, Any],
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """处理 taxonomy.tags — 获取 nhentai 可用标签列表。
+
+        使用 OpenAPI 规范中的正确端点：
+          - POST /api/v2/tags/search  — 关键词前缀搜索（当提供了 keyword 时）
+          - GET  /api/v2/tags/{tag_type} — 按类型分页获取全部标签（浏览模式）
+        """
+        keyword = str(params.get("keyword") or "").strip().lower()
+        category = str(params.get("category") or "").strip().lower()
+        now = time.time()
+
+        # 关键词搜索模式 — 使用 POST /api/v2/tags/search
+        if keyword:
+            return self._search_tags_by_keyword(session, config, keyword, category)
+
+        # 浏览模式 — 使用 GET /api/v2/tags/{tag_type} 按类型获取
+        cache = getattr(self, "_tags_cache", None)
+        if cache and now - cache["time"] < 600:
+            all_tags_by_type = cache["data"]
+        else:
+            all_tags_by_type = self._fetch_tags_by_type(session, config)
+            self._tags_cache = {"data": all_tags_by_type, "time": now}
+
+        # 按分类过滤
+        filtered = {}
+        for tag_type_str, tags in all_tags_by_type.items():
+            if category and tag_type_str != category:
+                continue
+            filtered[tag_type_str] = tags
+
+        categories = [
+            {"key": k, "name": k.capitalize(), "count": len(v)}
+            for k, v in filtered.items()
+        ]
+
+        if category:
+            all_tags = filtered.get(category, [])
+        else:
+            all_tags = []
+            for tags in filtered.values():
+                all_tags.extend(tags)
+
+        return {"tags": all_tags, "categories": categories}
+
+    def _search_tags_by_keyword(
+        self,
+        session: requests.Session,
+        config: Dict[str, Any],
+        keyword: str,
+        category: str,
+    ) -> Dict[str, Any]:
+        """使用 POST /api/v2/tags/search 按名称前缀搜索标签。"""
+        body: Dict[str, Any] = {"query": keyword, "limit": 50}
+        if category:
+            body["type"] = category
+
+        timeout = _as_int(config.get("timeout_seconds"), DEFAULT_TIMEOUT_SECONDS, 1, 600)
+        base_url = str(config.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+        url = f"{base_url}/api/v2/tags/search"
+
+        response = session.post(url, json=body, timeout=timeout)
+        if response.status_code >= 400:
+            raise RuntimeError(f"nhentai tags/search 失败: {response.status_code} {response.reason}")
+
+        try:
+            raw_tags = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"nhentai tags/search 响应解析失败: {exc}") from exc
+
+        if not isinstance(raw_tags, list):
+            raw_tags = []
+
+        # 归一化为统一格式
+        tags: List[Dict[str, Any]] = []
+        type_counts: Dict[str, int] = {}
+        for t in raw_tags:
+            if not isinstance(t, dict):
+                continue
+            tag_id = str(t.get("id") or "")
+            tag_name = str(t.get("name") or "").strip()
+            tag_type = str(t.get("type") or "tag").strip().lower()
+            tag_count = _as_int(t.get("count"), 0, 0)
+            if not tag_name:
+                continue
+            if category and tag_type != category:
+                continue
+            tags.append({
+                "id": tag_id,
+                "name": tag_name,
+                "count": tag_count,
+                "category": tag_type,
+            })
+            type_counts[tag_type] = type_counts.get(tag_type, 0) + 1
+
+        categories = [
+            {"key": k, "name": k.capitalize(), "count": v}
+            for k, v in type_counts.items()
+        ]
+
+        return {"tags": tags, "categories": categories}
+
+    def _fetch_tags_by_type(
+        self,
+        session: requests.Session,
+        config: Dict[str, Any],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """使用 GET /api/v2/tags/{tag_type} 获取所有已知类型的标签。"""
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        timeout = _as_int(config.get("timeout_seconds"), DEFAULT_TIMEOUT_SECONDS, 1, 600)
+        base_url = str(config.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+
+        for tag_type_str in _ALL_TAG_TYPES:
+            url = f"{base_url}/api/v2/tags/{tag_type_str}"
+            params = {"page": 1, "per_page": 100, "sort": "popular"}
+            try:
+                response = session.get(url, params=params, timeout=timeout)
+                if response.status_code != 200:
+                    continue
+                data = response.json()
+                raw_tags = list(data.get("result") or [])
+            except Exception:
+                continue
+
+            normalized: List[Dict[str, Any]] = []
+            for t in raw_tags:
+                if not isinstance(t, dict):
+                    continue
+                tag_id = str(t.get("id") or "")
+                tag_name = str(t.get("name") or "").strip()
+                tag_count = _as_int(t.get("count"), 0, 0)
+                if not tag_name:
+                    continue
+                normalized.append({
+                    "id": tag_id,
+                    "name": tag_name,
+                    "count": tag_count,
+                    "category": tag_type_str,
+                })
+            result[tag_type_str] = normalized
+
+        return result
+
+    def _handle_tag_search(
+        self,
+        session: requests.Session,
+        config: Dict[str, Any],
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """处理 taxonomy.tag_search — 通过标签名搜索 nhentai 作品。"""
+        tag_ids = params.get("tag_ids") or []
+        if not isinstance(tag_ids, list):
+            if isinstance(tag_ids, str):
+                tag_ids = [tag_ids]
+            else:
+                tag_ids = []
+        tag_ids = [str(tid).strip() for tid in tag_ids if str(tid).strip()]
+
+        page = _as_int(params.get("page"), 1, 1, 10000)
+
+        # 用标签名构造查询："tag:"name1" tag:"name2""
+        query_parts = [f'tag:"{tid}"' for tid in tag_ids if tid]
+        query = " ".join(query_parts) if query_parts else ""
+
+        api_params: Dict[str, Any] = {"page": page}
+        if query:
+            api_params["query"] = query
+
+        payload = self._api_get(session, config, "/api/v2/search", params=api_params)
+        if payload is None:
+            return {"page": page, "has_next": False, "albums": [], "query": query, "effective_tag_ids": tag_ids}
+
+        results = payload.get("result") if isinstance(payload, dict) else None
+        if results is None and isinstance(payload, list):
+            results = payload
+        results = list(results or [])
+
+        albums = [self._to_album_summary(config, dict(item)) for item in results if isinstance(item, dict)]
+        num_pages = _as_int(payload.get("num_pages") if isinstance(payload, dict) else 0, 1, 1, 100000)
+        has_next = page < num_pages
+
+        return {
+            "page": page,
+            "has_next": has_next,
+            "num_pages": num_pages,
+            "albums": albums,
+            "query": query,
+            "requested_tag_ids": tag_ids,
+            "effective_tag_ids": tag_ids,
+            "invalid_tag_ids": [],
+            "overridden_tag_ids": [],
+        }
 
     def _handle_search(
         self,
@@ -517,13 +777,21 @@ class NHentaiProvider(ProtocolProvider):
             raise RuntimeError("asset.cover.fetch 缺少 album_id 或 save_path。")
         gallery = self._resolve_gallery_raw(session, config, album_id)
         if not gallery:
-            return {"detail": {"album_id": album_id, "found": False}, "success": False}
+            return {
+                "detail": {"album_id": album_id, "found": False, "total_pages": 0, "local_pages": 0},
+                "success": False,
+            }
         cover_url = self._extract_cover_url(config, gallery)
         if not cover_url:
-            return {"detail": self._to_album_summary(config, gallery), "success": False}
+            detail = self._to_album_summary(config, gallery)
+            detail["total_pages"] = _as_int(gallery.get("num_pages"), 0, 0, 100000)
+            detail["local_pages"] = 0
+            return {"detail": detail, "success": False}
         ok = self._download_file(session, config, cover_url, save_path)
         detail = self._to_album_summary(config, gallery)
         detail["cover_path"] = save_path if ok else ""
+        detail["total_pages"] = _as_int(gallery.get("num_pages"), 0, 0, 100000)
+        detail["local_pages"] = 1 if ok else 0
         return {"detail": detail, "success": ok}
 
     def _handle_bundle_fetch(
@@ -539,7 +807,10 @@ class NHentaiProvider(ProtocolProvider):
         show_progress = _as_bool(params.get("show_progress"), False)
         gallery = self._resolve_gallery_raw(session, config, album_id)
         if not gallery:
-            return {"detail": {"album_id": album_id, "found": False}, "success": False}
+            return {
+                "detail": {"album_id": album_id, "found": False, "total_pages": 0, "local_pages": 0},
+                "success": False,
+            }
 
         image_urls = self._extract_full_image_urls(config, gallery)
         if not image_urls:
@@ -572,6 +843,7 @@ class NHentaiProvider(ProtocolProvider):
         detail["saved_files"] = saved_paths
         detail["downloaded_count"] = succeeded
         detail["total_count"] = total
+        detail["total_pages"] = total
         detail["local_pages"] = succeeded  # 兼容旧字段
         detail["pages_count"] = total
         return {
@@ -593,8 +865,5 @@ class NHentaiProvider(ProtocolProvider):
 
 
 def _get_logger():
-    try:
-        from infrastructure.logger import app_logger
-        return app_logger
-    except Exception:
-        return None
+    """插件自带日志器，不再反向依赖宿主内部模块。"""
+    return logging.getLogger(__name__)
